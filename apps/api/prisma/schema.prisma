@@ -1,0 +1,271 @@
+// AntiGravity Technologies — Prisma Schema
+// Database: PostgreSQL 16 + TimescaleDB extension
+// Run: npx prisma migrate dev --name init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Auth ──────────────────────────────────────────────────────────────────
+model Tenant {
+  id          String       @id @default(uuid())
+  name        String
+  plan        String       @default("RESEARCH")
+  users       User[]
+  experiments Experiment[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+}
+
+model User {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  name         String
+  role         UserRole  @default(RESEARCHER)
+  passwordHash String
+  mfaEnabled   Boolean   @default(false)
+  mfaSecret    String?
+  labGroup     String
+  tenant       Tenant    @relation(fields: [tenantId], references: [id])
+  tenantId     String
+  auditEntries AuditEntry[]
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([email])
+  @@index([tenantId])
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  LAB_ADMIN
+  RESEARCHER
+  HARDWARE_OPERATOR
+  SAFETY_OFFICER
+  AUDITOR
+}
+
+// ─── Experiments ──────────────────────────────────────────────────────────
+model Experiment {
+  id                  String            @id @default(uuid())
+  name                String
+  description         String?
+  status              ExperimentStatus  @default(DRAFT)
+  labGroup            String
+  researcher          String
+  tenant              Tenant            @relation(fields: [tenantId], references: [id])
+  tenantId            String
+  // Embedded JSONB configs
+  coilConfig          Json
+  safetyThresholds    Json
+  powerConsumption    Float             @default(0)
+  stabilityScore      Float             @default(0)
+  aiOptimized         Boolean           @default(false)
+  parameterSnapshot   String?           // SHA-256 of config at run-start
+  startedAt           DateTime?
+  completedAt         DateTime?
+  // Relations
+  telemetry           TelemetryReading[]
+  commands            HardwareCommand[]
+  simulationJobs      SimulationJob[]
+  optimizationResults OptimizationResult[]
+  safetyAlerts        SafetyAlert[]
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  @@index([tenantId, status])
+  @@index([tenantId, createdAt])
+}
+
+enum ExperimentStatus {
+  DRAFT
+  CONFIGURED
+  RUNNING
+  PAUSED
+  COMPLETED
+  ARCHIVED
+}
+
+// ─── Telemetry (TimescaleDB hypertable — partitioned on timestamp) ─────────
+model TelemetryReading {
+  id           String     @id @default(uuid())
+  experiment   Experiment @relation(fields: [experimentId], references: [id])
+  experimentId String
+  sensorType   SensorType
+  value        Float
+  unit         String
+  isAnomaly    Boolean    @default(false)
+  timestamp    DateTime   @default(now())
+
+  @@index([experimentId, sensorType, timestamp])
+  // TimescaleDB hypertable created via migration:
+  // SELECT create_hypertable('TelemetryReading', 'timestamp');
+}
+
+enum SensorType {
+  HALL_EFFECT
+  FLUX
+  THERMAL
+  ACCELEROMETER
+}
+
+// ─── Hardware Commands ──────────────────────────────────────────────────────
+model HardwareCommand {
+  id             String        @id @default(uuid())
+  experiment     Experiment    @relation(fields: [experimentId], references: [id])
+  experimentId   String
+  commandType    CommandType
+  payload        Json
+  status         CommandStatus @default(PENDING)
+  latencyMs      Float?
+  issuedBy       String
+  issuedAt       DateTime      @default(now())
+  acknowledgedAt DateTime?
+
+  @@index([experimentId, issuedAt])
+}
+
+enum CommandType {
+  SET_CURRENT
+  EMERGENCY_STOP
+  CALIBRATE
+  RESET
+}
+
+enum CommandStatus {
+  PENDING
+  ACKNOWLEDGED
+  FAILED
+}
+
+// ─── Safety ─────────────────────────────────────────────────────────────────
+model SafetyAlert {
+  id             String        @id @default(uuid())
+  experiment     Experiment    @relation(fields: [experimentId], references: [id])
+  experimentId   String
+  severity       AlertSeverity
+  title          String
+  message        String
+  sensorType     SensorType?
+  value          Float?
+  threshold      Float?
+  acknowledged   Boolean       @default(false)
+  acknowledgedBy String?
+  triggeredAt    DateTime      @default(now())
+  acknowledgedAt DateTime?
+
+  @@index([experimentId, triggeredAt])
+  @@index([severity, acknowledged])
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+// ─── Simulation ──────────────────────────────────────────────────────────────
+model SimulationJob {
+  id                String         @id @default(uuid())
+  experiment        Experiment     @relation(fields: [experimentId], references: [id])
+  experimentId      String
+  coilConfig        Json
+  status            SimJobStatus   @default(QUEUED)
+  progress          Int            @default(0)
+  avgFluxDensity    Float?
+  peakFluxDensity   Float?
+  simulationTimeMs  Int?
+  fieldVectorCount  Int?
+  error             String?
+  createdAt         DateTime       @default(now())
+  startedAt         DateTime?
+  completedAt       DateTime?
+
+  @@index([experimentId, status])
+}
+
+enum SimJobStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+// ─── AI Optimizer ────────────────────────────────────────────────────────────
+model OptimizationResult {
+  id                    String       @id @default(uuid())
+  experiment            Experiment   @relation(fields: [experimentId], references: [id])
+  experimentId          String
+  agentVersion          String
+  modelRunId            String
+  currentConfig         Json
+  suggestedConfig       Json
+  expectedPowerSavingPct Float
+  expectedStabilityPct  Float
+  rewardScore           Float
+  confidence            Float
+  status                OptStatus    @default(PENDING)
+  approvedBy            String?
+  generatedAt           DateTime     @default(now())
+  appliedAt             DateTime?
+
+  @@index([experimentId, generatedAt])
+}
+
+enum OptStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  APPLIED
+}
+
+// ─── Audit Log (append-only) ─────────────────────────────────────────────────
+model AuditEntry {
+  id          String   @id @default(uuid())
+  user        User?    @relation(fields: [userId], references: [id])
+  userId      String
+  userName    String
+  action      String
+  resource    String
+  resourceId  String
+  payload     Json?
+  hashChain   String   // SHA-256(prevHash + action + resourceId + timestamp)
+  prevHash    String
+  ipAddress   String
+  timestamp   DateTime @default(now())
+
+  @@index([userId, timestamp])
+  @@index([action, timestamp])
+  @@index([resource, resourceId])
+}
+
+// ─── Notifications ────────────────────────────────────────────────────────────
+model Notification {
+  id        String           @id @default(uuid())
+  type      NotifType
+  title     String
+  message   String
+  severity  AlertSeverity
+  channel   NotifChannel
+  delivered Boolean          @default(false)
+  createdAt DateTime         @default(now())
+}
+
+enum NotifType {
+  SAFETY_ALERT
+  EXPERIMENT_STATE
+  AI_RESULT
+  SYSTEM
+}
+
+enum NotifChannel {
+  IN_APP
+  EMAIL
+  WEBHOOK
+  SMS
+}

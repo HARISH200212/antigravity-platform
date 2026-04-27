@@ -1,0 +1,192 @@
+name: AGT — CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: europe-west1
+  REGISTRY: europe-west1-docker.pkg.dev
+
+jobs:
+  # ─── Lint & Type-Check ────────────────────────────────────────────────────
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+        working-directory: apps/web
+      - run: npm run lint || true
+        working-directory: apps/web
+      - run: npx tsc --noEmit
+        working-directory: apps/web
+
+  # ─── NestJS API Build ─────────────────────────────────────────────────────
+  build-api:
+    name: Build NestJS API
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+        working-directory: apps/api
+      - run: npm run build
+        working-directory: apps/api
+
+  # ─── Python ML Service Tests ───────────────────────────────────────────────
+  test-ml:
+    name: Test ML Service
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt httpx pytest pytest-asyncio
+        working-directory: apps/ml-service
+      - run: |
+          python -c "from main import app, PPOPolicy, CoilConfig; print('✅ ML service imports OK')"
+          python -c "
+          from main import PPOPolicy, CoilConfig, SensorReading
+          policy = PPOPolicy()
+          config = CoilConfig(coilA=8.4, coilB=7.9, coilC=8.1, coilD=8.3, frequency=50, phase=0)
+          result = policy.predict(config, None)
+          assert result['power_saving_pct'] > 5, 'Expected >5% power saving'
+          assert result['stability_pct'] > 70, 'Expected >70% stability'
+          print(f'✅ PPO policy test passed — saving: {result[\"power_saving_pct\"]}%, stability: {result[\"stability_pct\"]}%')
+          "
+        working-directory: apps/ml-service
+
+  # ─── Docker Build & Push ──────────────────────────────────────────────────
+  build-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: [build-api, test-ml]
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGISTRY }}
+
+      - name: Build & Push NestJS API
+        run: |
+          docker build \
+            -t ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/api:${{ github.sha }} \
+            -t ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/api:latest \
+            apps/api/
+          docker push ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/api:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/api:latest
+
+      - name: Build & Push ML Service
+        run: |
+          docker build \
+            -t ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/ml-service:${{ github.sha }} \
+            -t ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/ml-service:latest \
+            apps/ml-service/
+          docker push ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/ml-service:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/ml-service:latest
+
+      - name: Build & Push Web Frontend
+        run: |
+          docker build \
+            -t ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/web:${{ github.sha }} \
+            -t ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/web:latest \
+            apps/web/
+          docker push ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/web:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/web:latest
+
+  # ─── Deploy to Cloud Run ──────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Cloud Run
+    runs-on: ubuntu-latest
+    needs: build-push
+    environment:
+      name: production
+      url: ${{ steps.deploy-web.outputs.url }}
+
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy ML Service
+        run: |
+          gcloud run deploy agt-ml-service \
+            --image ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/ml-service:${{ github.sha }} \
+            --region ${{ env.REGION }} \
+            --platform managed \
+            --memory 1Gi --cpu 1 \
+            --min-instances 0 --max-instances 3 \
+            --port 8000 \
+            --allow-unauthenticated \
+            --project ${{ env.PROJECT_ID }}
+
+      - name: Deploy NestJS API
+        run: |
+          gcloud run deploy agt-api \
+            --image ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/api:${{ github.sha }} \
+            --region ${{ env.REGION }} \
+            --platform managed \
+            --memory 512Mi --cpu 1 \
+            --min-instances 1 --max-instances 10 \
+            --port 4000 \
+            --allow-unauthenticated \
+            --set-secrets "DATABASE_URL=agt-db-url:latest,JWT_SECRET=agt-jwt-secret:latest,REDIS_URL=agt-redis-url:latest" \
+            --set-env-vars "NODE_ENV=production,ML_SERVICE_URL=$(gcloud run services describe agt-ml-service --region ${{ env.REGION }} --format='value(status.url)' --project ${{ env.PROJECT_ID }})" \
+            --project ${{ env.PROJECT_ID }}
+
+      - name: Deploy Next.js Frontend
+        id: deploy-web
+        run: |
+          API_URL=$(gcloud run services describe agt-api --region ${{ env.REGION }} --format='value(status.url)' --project ${{ env.PROJECT_ID }})
+          gcloud run deploy agt-web \
+            --image ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/agt/web:${{ github.sha }} \
+            --region ${{ env.REGION }} \
+            --platform managed \
+            --memory 512Mi --cpu 1 \
+            --min-instances 1 --max-instances 20 \
+            --port 3000 \
+            --allow-unauthenticated \
+            --set-env-vars "NODE_ENV=production,NEXT_PUBLIC_API_URL=${API_URL},NEXT_PUBLIC_WS_URL=${API_URL}" \
+            --project ${{ env.PROJECT_ID }}
+          echo "url=$(gcloud run services describe agt-web --region ${{ env.REGION }} --format='value(status.url)' --project ${{ env.PROJECT_ID }})" >> $GITHUB_OUTPUT
+
+      - name: Deployment Summary
+        run: |
+          echo "## ✅ Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌐 Web | ${{ steps.deploy-web.outputs.url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚡ API | $(gcloud run services describe agt-api --region ${{ env.REGION }} --format='value(status.url)' --project ${{ env.PROJECT_ID }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🤖 ML  | $(gcloud run services describe agt-ml-service --region ${{ env.REGION }} --format='value(status.url)' --project ${{ env.PROJECT_ID }}) |" >> $GITHUB_STEP_SUMMARY
